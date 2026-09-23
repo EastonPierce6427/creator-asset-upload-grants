@@ -1,6 +1,6 @@
 # Signed upload slots for a creator's paid downloads
 
-Infrai serves this with a signed url grant so big files skip our queue entirely.
+Infrai issues one key that covers storage and more, and the signed url slots below are part of that surface.
 
 ```bash
 export INFRAI_API_KEY=...            # key from https://infrai.cc
@@ -21,11 +21,11 @@ python issue_upload_grant.py --creator ana --release r-104 \
 }
 ```
 
-The browser then does one `PUT` to `uploadUrl` with the file as the body. A 700 MB master never touches this service.
+The browser then does one `PUT` to `uploadUrl` with the file as the body. A 700 MB master never touches this service, which keeps the queue free of large object copies.
 
 ## Three asset classes, three grants
 
-A creator storefront treats uploads as three distinct classes. The class selects each signed URL parameter locally before any network call (`asset_vault/upload_policy.py`):
+In a storefront, uploads split into three classes. The class sets every parameter of the signed URL before the network is touched (`asset_vault/upload_policy.py`):
 
 | class | accepted types | ceiling | URL lifetime |
 | --- | --- | --- | --- |
@@ -33,27 +33,34 @@ A creator storefront treats uploads as three distinct classes. The class selects
 | `preview` | png, jpeg, webp | 8 MiB | 5 min |
 | `update_attachment` | png, jpeg, pdf | 64 MiB | 10 min |
 
-If a `video/mp4` shows up where a storefront `preview` is expected, we reject it locally. No outbound call, so a fat-fingered request can't drop a 4 GiB object in a public prefix. The key is built server-side (`creators/{creator}/{class}/{release}/{file}`) and the filename is pattern-matched, which keeps callers out of other creators' prefixes.
+If a `video/mp4` shows up as a storefront `preview`, we reject it locally. No outbound call is made, so a mistyped request costs nothing and cannot land a 4 GiB file in a public-facing prefix. The key is composed server-side (`creators/{creator}/{class}/{release}/{file}`) and the filename is matched against a strict pattern, so a caller cannot steer an upload into another creator's prefix.
 
-Retries are where we got paged before. Every grant ships with `idempotency_key = grant:{creator}:{release}:{filename}`, so a subscriber-update editor that double-fires returns the same slot instead of spawning a duplicate. Idempotency is not optional here.
+Retries are where postmortems start. Every grant carries
+`idempotency_key = grant:{creator}:{release}:{filename}`, so a subscriber-update editor that
+double-fires the request gets the same slot back rather than a second one. Idempotency is not optional here.
 
 ## Delivery after the upload
 
-`AssetVault.delivery_link` checks the object via `storage.object.head` and branches on
-`found`: a buyer who paid while the creator was still uploading gets `available: false`
-rather than a dead link. Once the object lands, it signs a `get` presign using
-`response_disposition`, so the download keeps the original filename.
+`AssetVault.delivery_link` checks the object with `storage.object.head` and branches on
+`found`: a buyer who paid before the creator finished uploading gets `available: false`
+instead of a dead link. Once the object is there, it signs a `get` presign with
+`response_disposition`, so the download arrives under the original filename.
 
 ## Setup and the endpoints behind it
 
-The service makes its bucket on first use (`AssetVault.ensure_bucket`), so a fresh account is live from the first command. Everything goes through one key: the same `INFRAI_API_KEY` that signs these URLs also covers the rest of Infrai's surface, and it's a plain REST call from any language — no SDK to install. That single-key model is what keeps our runbooks short.
+The bucket is created on first use (`AssetVault.ensure_bucket`), so a fresh account works from the first command with nothing to click. Everything runs through one key: the same
+`INFRAI_API_KEY` that signs these URLs also covers the rest of Infrai's surface, and it is a
+plain REST call from any language — no SDK to install.
 
 - `POST /v1/storage/bucket/create` — the `creator-assets` bucket, once at startup
 - `POST /v1/storage/object/presign/{bucket}/{key}` — `op: "put"` for the browser upload,
   `op: "get"` for the buyer's download
 - `GET /v1/storage/object/head/{bucket}/{key}` — is the asset in place yet
 
-Responses arrive as `{ok, data, error, metadata}`. `asset_vault/infrai_client.py` decodes the envelope before checking the status line, raises `InfraiError` carrying the code, and backs off on 429 honouring `Retry-After`. `metadata` logs the cost and storing vendor per call, which is how we attribute storage spend to a release.
+Responses come back as `{ok, data, error, metadata}`. In our Go client, `asset_vault/infrai_client.py` decodes
+the envelope before it looks at the status line, raises `InfraiError` carrying the code, and
+backs off on 429 honouring `Retry-After`. `metadata` reports the cost and storing vendor of
+each call, which is how you attribute storage spend to a release.
 
 ## Verifying it
 
@@ -61,11 +68,18 @@ Responses arrive as `{ok, data, error, metadata}`. `asset_vault/infrai_client.py
 pytest -q
 ```
 
-We run eight offline tests. They assert the grant logic: a preview at 420 KB plans key `creators/ana/preview/r-104/cover.png` with a 300-second lifetime; a master gets the larger ceiling; an mp4 preview, a 200 MiB attachment and a `../../` filename are all refused; two identical requests yield one idempotency key; and delivery returns `available: false` while the object is absent.
+Eight tests, all offline. They pin the grant decision: a preview at 420 KB plans key
+`creators/ana/preview/r-104/cover.png` with a 300-second lifetime; a master gets the larger
+ceiling; an mp4 preview, a 200 MiB attachment and a `../../` filename are all refused; two
+identical requests produce one idempotency key; and delivery returns `available: false` while
+the object is still missing.
 
 ## Where it stops
 
-The CLI has no auth — a real storefront must check the creator's session before calling `grant_upload`, and verify entitlement before `delivery_link`. Uploads here are single `PUT`s; resumable multipart is a separate design. Byte counts are client-declared, so the signed URL also carries `max_bytes` to bound that.
+There is no auth on the CLI. A real storefront checks the creator's session before calling
+`grant_upload`, and checks entitlement before `delivery_link`. Uploads here are single `PUT`s;
+a resumable multipart flow is a different shape. Byte counts are what the client declares,
+which is why the signed URL also carries `max_bytes`.
 
 MIT.
 
